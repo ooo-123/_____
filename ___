@@ -1005,4 +1005,98 @@ def partial_close_trade(n_clicks, data, trade_id, partial_size, partial_comments
                     trade['realized_pnl'] = realized_pnl
                     trade['pips_gained'] = pips_gained
                     # Update cumulative PNL
-                   
+
+
+    # Callback to handle partial closing a trade
+    @app.callback(
+        Output('trade-data', 'data'),
+        Input('confirm-partial-button', 'n_clicks'),
+        State('trade-data', 'data'),
+        State('current-trade-id', 'children'),
+        State('partial-size-input', 'value'),
+        State('partial-comments-input', 'value'),
+        prevent_initial_call=True
+    )
+    def partial_close_trade(n_clicks, data, trade_id, partial_size, partial_comments):
+        if n_clicks > 0 and trade_id:
+            for trade in data:
+                if trade['trade_id'] == int(trade_id) and trade['action'] == 'open':
+                    if partial_size and partial_size < trade['size']:
+                        # Create a new trade for the partial close
+                        new_trade_id = len(data) + 1
+                        now = datetime.datetime.now()
+                        datetime_str = format_datetime(now)
+                        realized_pnl, pips_gained = calculate_pnl(
+                            trade['direction'],
+                            trade['entry_price'],
+                            trade['close_price'] if trade['close_price'] else trade['entry_price'],
+                            partial_size
+                        )
+                        new_trade = {
+                            'trade_id': new_trade_id,
+                            'datetime': datetime_str,
+                            'close_datetime': format_datetime(now),
+                            'trade_duration': '0:00:00',
+                            'action': 'closed',
+                            'direction': trade['direction'],
+                            'size': partial_size,
+                            'entry_price': trade['entry_price'],
+                            'close_price': trade['close_price'] if trade['close_price'] else trade['entry_price'],
+                            'tp_level': trade['tp_level'],
+                            'sl_level': trade['sl_level'],
+                            'risk_reward_ratio': None,
+                            'realized_pnl': realized_pnl,
+                            'cumulative_pnl': 0.0,  # Will be updated later
+                            'pips_gained': pips_gained,
+                            'closure_reason': 'Partial Close',
+                            'TSL': None,
+                            'comments': partial_comments,
+                            'PNL_comment': None,
+                            'partial_tp_comment': None,
+                            'partial_tp_datetime': format_datetime(now),
+                            'partial_tp_close_price': trade['close_price'] if trade['close_price'] else trade['entry_price'],
+                            'Group_ID': trade['Group_ID']
+                        }
+                        data.append(new_trade)
+                        # Reduce the size of the original trade
+                        trade['size'] -= partial_size
+                        # Update cumulative PNL
+                        cumulative = sum([t['realized_pnl'] for t in data if t['realized_pnl'] is not None])
+                        trade['cumulative_pnl'] = round(cumulative, 2)
+                    elif partial_size and partial_size >= trade['size']:
+                        # Close the trade entirely
+                        trade['close_datetime'] = format_datetime(datetime.datetime.now())
+                        # Calculate trade duration
+                        try:
+                            # Remove suffix before parsing
+                            day_str = trade['datetime'].split()[0]
+                            day_number = ''.join(filter(str.isdigit, day_str))
+                            trade_start = datetime.datetime.strptime(
+                                trade['datetime'].replace(day_str, day_number),
+                                '%d %b %Y %H:%M'
+                            )
+                        except ValueError:
+                            # Fallback in case of unexpected format
+                            trade_start = datetime.datetime.now()
+                        trade_duration = datetime.datetime.now() - trade_start
+                        trade['trade_duration'] = str(trade_duration)
+                        trade['action'] = 'closed'
+                        trade['close_price'] = trade['close_price'] if trade['close_price'] else trade['entry_price']
+                        trade['closure_reason'] = 'Partial Close'
+                        trade['comments'] = partial_comments if partial_comments else trade['comments']
+                        # Calculate PNL
+                        realized_pnl, pips_gained = calculate_pnl(
+                            trade['direction'],
+                            trade['entry_price'],
+                            trade['close_price'],
+                            trade['size']
+                        )
+                        trade['realized_pnl'] = realized_pnl
+                        trade['pips_gained'] = pips_gained
+                        # Update cumulative PNL
+                        cumulative = sum([t['realized_pnl'] for t in data if t['realized_pnl'] is not None])
+                        trade['cumulative_pnl'] = round(cumulative, 2)
+                    break
+            return data
+        else:
+            raise dash.exceptions.PreventUpdate
