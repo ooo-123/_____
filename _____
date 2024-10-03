@@ -1,0 +1,811 @@
+import dash
+import dash_bootstrap_components as dbc
+from dash import html, dcc, dash_table, Input, Output, State, callback_context
+import pandas as pd
+import datetime
+
+# Initialize the Dash app with a dark theme
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.DARKLY])
+app.title = "Trade Journaling Application"
+
+# Define the columns for the trade table
+trade_columns = [
+    'trade_id', 'datetime', 'close_datetime', 'trade_duration', 'action',
+    'direction', 'size', 'entry_price', 'close_price', 'tp_level', 'sl_level',
+    'risk_reward_ratio', 'realized_pnl', 'cumulative_pnl', 'pips_gained',
+    'closure_reason', 'TSL', 'comments', 'PNL_comment', 'partial_tp_comment',
+    'partial_tp_datetime', 'partial_tp_close_price', 'Group_ID'
+]
+
+# Initialize an empty DataFrame to store trades
+trade_history = pd.DataFrame(columns=trade_columns)
+
+# Function to format datetime with appropriate suffix
+def format_datetime(dt):
+    day = dt.day
+    suffix = 'th' if 11 <= day <= 13 else {1: 'st', 2: 'nd', 3: 'rd'}.get(day % 10, 'th')
+    return dt.strftime(f'%d{suffix} %b %Y %H:%M')
+
+# Function to calculate PnL
+def calculate_pnl(direction, entry_price, close_price, size):
+    position_sign = 1 if direction == 'long' else -1
+    pips = (close_price - entry_price) / 0.0001
+    pips_gained = pips * position_sign
+    realized_pnl = pips_gained * 10 * (size / 1_000_000)  # $10 per pip per 1M
+    return round(realized_pnl, 2), round(pips_gained, 2)
+
+# App layout
+app.layout = dbc.Container([
+    html.H1('Trade Journaling Application', className='text-center mb-4'),
+
+    # Market Price Input
+    dbc.Row([
+        dbc.Col([
+            dbc.Label('Market Price', html_for='market-price-input'),
+            dbc.Input(
+                id='market-price-input',
+                type='number',
+                value=0.6890,
+                step=0.0001,
+                style={'width': '100%'},
+            ),
+        ], width=2),
+    ], className='mb-4'),
+
+    # New Trade Entry Form
+    html.H2('Enter New Trade', className='mb-3'),
+    dbc.Form([
+        dbc.Row([
+            dbc.Col([
+                dbc.Label('Direction', html_for='direction-input'),
+                dcc.Dropdown(
+                    id='direction-input',
+                    options=[{'label': 'Long', 'value': 'long'}, {'label': 'Short', 'value': 'short'}],
+                    value='long',
+                    clearable=False,
+                    style={'width': '100%', 'color': 'black'}
+                ),
+            ], width=2),
+            dbc.Col([
+                dbc.Label('Size (in AUD)', html_for='size-input'),
+                dbc.Input(
+                    id='size-input',
+                    type='number',
+                    value=1000000,
+                    step=100000,
+                    style={'width': '100%'}
+                ),
+            ], width=2),
+            dbc.Col([
+                dbc.Label('Entry Price', html_for='entry-price-input'),
+                dbc.Input(
+                    id='entry-price-input',
+                    type='number',
+                    value=0.6890,  # Default to market price
+                    step=0.0001,
+                    style={'width': '100%'}
+                ),
+            ], width=2),
+            dbc.Col([
+                dbc.Label('TP Level', html_for='tp-level-input'),
+                dbc.Input(
+                    id='tp-level-input',
+                    type='number',
+                    value=0.6920,  # Default value
+                    step=0.0001,
+                    style={'width': '100%'}
+                ),
+            ], width=2),
+            dbc.Col([
+                dbc.Label('SL Level', html_for='sl-level-input'),
+                dbc.Input(
+                    id='sl-level-input',
+                    type='number',
+                    value=0.6865,  # Default value
+                    step=0.0001,
+                    style={'width': '100%'}
+                ),
+            ], width=2),
+            dbc.Col([
+                dbc.Label('Comments', html_for='comments-input'),
+                dbc.Input(
+                    id='comments-input',
+                    type='text',
+                    style={'width': '100%'}
+                ),
+            ], width=2),
+            dbc.Col([
+                dbc.Button('Add Trade', id='add-trade-button', n_clicks=0, color='primary', className='mt-4'),
+            ], width=2),
+        ], className='mb-4', align='center'),
+    ]),
+
+    # Grouped Trade Table
+    html.H2('Trade Groups', className='mb-3'),
+    dash_table.DataTable(
+        id='group-table',
+        columns=[
+            {'name': 'Group ID', 'id': 'Group_ID'},
+            {'name': 'Net Direction', 'id': 'net_direction'},
+            {'name': 'Total Size (AUD)', 'id': 'total_size'},
+            {'name': 'Average Entry Price', 'id': 'avg_entry_price'},
+            {'name': 'Realized PNL ($)', 'id': 'realized_pnl'},
+            {'name': 'Unrealized PNL ($)', 'id': 'unrealized_pnl'},
+            {'name': 'Actions', 'id': 'actions', 'presentation': 'markdown'},
+        ],
+        data=[],
+        editable=False,
+        row_deletable=False,
+        sort_action='native',
+        page_action='none',
+        style_table={'overflowX': 'auto'},
+        style_cell={'textAlign': 'left'},
+        style_header={
+            'backgroundColor': 'rgb(30, 30, 30)',
+            'color': 'white',
+            'fontWeight': 'bold'
+        },
+        style_data={
+            'backgroundColor': 'rgb(50, 50, 50)',
+            'color': 'white'
+        },
+        style_cell_conditional=[
+            {'if': {'column_id': 'actions'},
+             'width': '15%'},
+        ],
+        markdown_options={'html': True},
+        css=[
+            {
+                'selector': '.dash-cell div.dash-cell-value a.view-trades',
+                'rule': 'display: inline-block; padding: 5px 10px; background-color: #1f78b4; color: white; border-radius: 3px; text-decoration: none;'
+            },
+        ],
+    ),
+
+    # Detailed Trade Table (Visible upon selecting a group)
+    html.Div(id='detailed-trade-table-container'),
+
+    # Modals for Modify, Close, Partial Close
+
+    # Modify Modal
+    dbc.Modal([
+        dbc.ModalHeader(dbc.ModalTitle("Modify Trade")),
+        dbc.ModalBody([
+            dbc.Form([
+                dbc.Row([
+                    dbc.Col([
+                        dbc.Label('Size (in AUD)', html_for='modify-size-input'),
+                        dbc.Input(
+                            id='modify-size-input',
+                            type='number',
+                            step=100000,
+                            style={'width': '100%'}
+                        ),
+                    ], width=6),
+                    dbc.Col([
+                        dbc.Label('TP Level', html_for='modify-tp-level-input'),
+                        dbc.Input(
+                            id='modify-tp-level-input',
+                            type='number',
+                            step=0.0001,
+                            style={'width': '100%'}
+                        ),
+                    ], width=6),
+                ], className='mb-3'),
+                dbc.Row([
+                    dbc.Col([
+                        dbc.Label('SL Level', html_for='modify-sl-level-input'),
+                        dbc.Input(
+                            id='modify-sl-level-input',
+                            type='number',
+                            step=0.0001,
+                            style={'width': '100%'}
+                        ),
+                    ], width=6),
+                    dbc.Col([
+                        dbc.Label('Comments', html_for='modify-comments-input'),
+                        dbc.Input(
+                            id='modify-comments-input',
+                            type='text',
+                            style={'width': '100%'}
+                        ),
+                    ], width=6),
+                ], className='mb-3'),
+            ]),
+        ]),
+        dbc.ModalFooter([
+            dbc.Button("Save Changes", id="save-modify-button", color="primary"),
+            dbc.Button("Close", id="close-modify-modal", className="ms-auto", color="secondary"),
+        ]),
+    ], id="modify-modal", is_open=False, centered=True),
+
+    # Close Modal
+    dbc.Modal([
+        dbc.ModalHeader(dbc.ModalTitle("Close Trade")),
+        dbc.ModalBody([
+            dbc.Form([
+                dbc.Row([
+                    dbc.Col([
+                        dbc.Label('Closure Reason', html_for='close-reason-input'),
+                        dcc.Dropdown(
+                            id='close-reason-input',
+                            options=[
+                                {'label': 'TP Hit', 'value': 'TP hit'},
+                                {'label': 'SL Hit', 'value': 'SL hit'},
+                                {'label': 'Manual Close', 'value': 'manual close'},
+                            ],
+                            value='manual close',
+                            clearable=False,
+                            style={'width': '100%', 'color': 'black'}
+                        ),
+                    ], width=6),
+                    dbc.Col([
+                        dbc.Label('Close Price', html_for='close-price-input'),
+                        dbc.Input(
+                            id='close-price-input',
+                            type='number',
+                            step=0.0001,
+                            style={'width': '100%'}
+                        ),
+                    ], width=6),
+                ], className='mb-3'),
+                dbc.Row([
+                    dbc.Col([
+                        dbc.Label('Comments', html_for='close-comments-input'),
+                        dbc.Input(
+                            id='close-comments-input',
+                            type='text',
+                            style={'width': '100%'}
+                        ),
+                    ], width=12),
+                ], className='mb-3'),
+            ]),
+        ]),
+        dbc.ModalFooter([
+            dbc.Button("Confirm Close", id="confirm-close-button", color="danger"),
+            dbc.Button("Cancel", id="close-close-modal", className="ms-auto", color="secondary"),
+        ]),
+    ], id="close-modal", is_open=False, centered=True),
+
+    # Partial Close Modal
+    dbc.Modal([
+        dbc.ModalHeader(dbc.ModalTitle("Partial Close Trade")),
+        dbc.ModalBody([
+            dbc.Form([
+                dbc.Row([
+                    dbc.Col([
+                        dbc.Label('Partial Size (in AUD)', html_for='partial-size-input'),
+                        dbc.Input(
+                            id='partial-size-input',
+                            type='number',
+                            step=100000,
+                            style={'width': '100%'}
+                        ),
+                        dbc.FormText("Default is 50% of remaining size."),
+                    ], width=6),
+                    dbc.Col([
+                        dbc.Label('Comments', html_for='partial-comments-input'),
+                        dbc.Input(
+                            id='partial-comments-input',
+                            type='text',
+                            style={'width': '100%'}
+                        ),
+                    ], width=6),
+                ], className='mb-3'),
+            ]),
+        ]),
+        dbc.ModalFooter([
+            dbc.Button("Confirm Partial Close", id="confirm-partial-button", color="warning"),
+            dbc.Button("Cancel", id="close-partial-modal", className="ms-auto", color="secondary"),
+        ]),
+    ], id="partial-modal", is_open=False, centered=True),
+
+    # Hidden div to store the trade ID being modified/closed
+    html.Div(id='current-trade-id', style={'display': 'none'}),
+
+    # Store component to hold trade data
+    dcc.Store(id='trade-data', data=trade_history.to_dict('records')),
+
+], fluid=True)
+
+# Callback to update Entry Price, TP Level, and SL Level based on Market Price and Direction
+@app.callback(
+    [
+        Output('entry-price-input', 'value'),
+        Output('tp-level-input', 'value'),
+        Output('sl-level-input', 'value')
+    ],
+    [
+        Input('market-price-input', 'value'),
+        Input('direction-input', 'value')
+    ]
+)
+def update_entry_tp_sl(market_price, direction):
+    if market_price is None or direction is None:
+        raise dash.exceptions.PreventUpdate
+    entry_price = market_price
+    pip_value = 0.0001
+    tp_pips = 30 * pip_value  # 30 pips
+    sl_pips = 25 * pip_value  # 25 pips
+    if direction == 'long':
+        tp_level = entry_price + tp_pips
+        sl_level = entry_price - sl_pips
+    else:  # 'short'
+        tp_level = entry_price - tp_pips
+        sl_level = entry_price + sl_pips
+    # Round to 5 decimal places
+    entry_price = round(entry_price, 5)
+    tp_level = round(tp_level, 5)
+    sl_level = round(sl_level, 5)
+    return entry_price, tp_level, sl_level
+
+# Callback to add a new trade
+@app.callback(
+    Output('trade-data', 'data'),
+    Input('add-trade-button', 'n_clicks'),
+    State('trade-data', 'data'),
+    State('direction-input', 'value'),
+    State('size-input', 'value'),
+    State('entry-price-input', 'value'),
+    State('tp-level-input', 'value'),
+    State('sl-level-input', 'value'),
+    State('comments-input', 'value'),
+    prevent_initial_call=True
+)
+def add_trade(n_clicks, data, direction, size, entry_price, tp_level, sl_level, comments):
+    if n_clicks > 0:
+        trade_id = len(data) + 1
+        now = datetime.datetime.now()
+        datetime_str = format_datetime(now)
+        # Determine Group_ID
+        if data:
+            last_group_id = max(trade['Group_ID'] for trade in data)
+        else:
+            last_group_id = 0
+        group_id = last_group_id + 1  # Assign a new group ID
+
+        new_trade = {
+            'trade_id': trade_id,
+            'datetime': datetime_str,
+            'close_datetime': None,
+            'trade_duration': None,
+            'action': 'open',
+            'direction': direction,
+            'size': size,
+            'entry_price': entry_price,
+            'close_price': None,
+            'tp_level': tp_level,
+            'sl_level': sl_level,
+            'risk_reward_ratio': None,
+            'realized_pnl': 0.0,
+            'cumulative_pnl': 0.0,
+            'pips_gained': 0.0,
+            'closure_reason': None,
+            'TSL': None,
+            'comments': comments,
+            'PNL_comment': None,
+            'partial_tp_comment': None,
+            'partial_tp_datetime': None,
+            'partial_tp_close_price': None,
+            'Group_ID': group_id
+        }
+        data.append(new_trade)
+        return data
+    else:
+        raise dash.exceptions.PreventUpdate
+
+# Callback to update group table and calculate PNL
+@app.callback(
+    Output('group-table', 'data'),
+    [Input('trade-data', 'data'), Input('market-price-input', 'value')]
+)
+def update_group_table(data, market_price):
+    groups = {}
+    for trade in data:
+        group_id = trade['Group_ID']
+        if group_id not in groups:
+            groups[group_id] = {
+                'Group_ID': group_id,
+                'net_size': 0,
+                'total_size': 0,
+                'sum_entry_price': 0,
+                'realized_pnl': 0.0,
+                'unrealized_pnl': 0.0,
+                'trades': []
+            }
+        groups[group_id]['trades'].append(trade)
+        size = trade['size'] if trade['direction'] == 'long' else -trade['size']
+        groups[group_id]['net_size'] += size
+        groups[group_id]['total_size'] += abs(size)
+        groups[group_id]['sum_entry_price'] += trade['entry_price'] * abs(size)
+        groups[group_id]['realized_pnl'] += trade.get('realized_pnl', 0.0)
+
+    group_data = []
+    for group_id, details in groups.items():
+        net_direction = 'Long' if details['net_size'] > 0 else 'Short' if details['net_size'] < 0 else 'Flat'
+        avg_entry_price = (details['sum_entry_price'] / details['total_size']) if details['total_size'] != 0 else 0
+        # Calculate unrealized PNL based on market price
+        if net_direction == 'Flat':
+            unrealized_pnl = 0.0
+        else:
+            direction_sign = 1 if net_direction == 'Long' else -1
+            # Calculate pips gained based on average entry price and market price
+            pips_gained = (market_price - avg_entry_price) / 0.0001 * direction_sign
+            # unrealized_pnl = pips_gained * 10 * (abs(details['net_size']) / 1_000_000)
+            # However, need to calculate unrealized PNL per trade, aggregate
+            unrealized_pnl = pips_gained * 10 * (details['total_size'] / 1_000_000)
+            unrealized_pnl = round(unrealized_pnl, 2)
+        group = {
+            'Group_ID': group_id,
+            'net_direction': net_direction,
+            'total_size': details['total_size'],
+            'avg_entry_price': round(avg_entry_price, 5),
+            'realized_pnl': round(details['realized_pnl'], 2),
+            'unrealized_pnl': unrealized_pnl,
+            'actions': f"<a href='#' class='view-trades'>View Trades</a>"
+        }
+        group_data.append(group)
+
+    return group_data
+
+# Callback to display detailed trades for a selected group
+@app.callback(
+    Output('detailed-trade-table-container', 'children'),
+    Input('group-table', 'active_cell'),
+    State('group-table', 'data'),
+    State('trade-data', 'data'),
+    prevent_initial_call=True
+)
+def display_detailed_trades(active_cell, group_data, trade_data):
+    if active_cell:
+        row = active_cell['row']
+        column = active_cell['column_id']
+        if column == 'actions':
+            group_id = group_data[row]['Group_ID']
+            # Filter trades belonging to this group
+            detailed_trades = [trade for trade in trade_data if trade['Group_ID'] == group_id]
+            detailed_trades_sorted = sorted(detailed_trades, key=lambda x: x['trade_id'], reverse=True)
+
+            # Add action buttons with HTML links and classes
+            for trade in detailed_trades_sorted:
+                trade_id = trade['trade_id']
+                trade['Modify'] = f"<a href='#' class='modify-button'>Modify</a>"
+                trade['Close'] = f"<a href='#' class='close-button'>Close</a>"
+                trade['Partial Close'] = f"<a href='#' class='partial-close-button'>Partial Close</a>"
+
+            # Create detailed trade table
+            detailed_table = dash_table.DataTable(
+                id='detailed-trade-table',
+                columns=[
+                    {'name': 'Trade ID', 'id': 'trade_id'},
+                    {'name': 'Datetime', 'id': 'datetime'},
+                    {'name': 'Direction', 'id': 'direction'},
+                    {'name': 'Size (AUD)', 'id': 'size'},
+                    {'name': 'Entry Price', 'id': 'entry_price'},
+                    {'name': 'Close Price', 'id': 'close_price'},
+                    {'name': 'TP Level', 'id': 'tp_level'},
+                    {'name': 'SL Level', 'id': 'sl_level'},
+                    {'name': 'Realized PNL ($)', 'id': 'realized_pnl'},
+                    {'name': 'Pips Gained', 'id': 'pips_gained'},
+                    {'name': 'Comments', 'id': 'comments'},
+                    {'name': 'Modify', 'id': 'Modify', 'presentation': 'markdown'},
+                    {'name': 'Close', 'id': 'Close', 'presentation': 'markdown'},
+                    {'name': 'Partial Close', 'id': 'Partial Close', 'presentation': 'markdown'},
+                ],
+                data=detailed_trades_sorted,
+                editable=False,
+                row_deletable=False,
+                sort_action='native',
+                page_action='none',
+                style_table={'overflowX': 'auto'},
+                style_cell={'textAlign': 'left'},
+                style_header={
+                    'backgroundColor': 'rgb(30, 30, 30)',
+                    'color': 'white',
+                    'fontWeight': 'bold'
+                },
+                style_data={
+                    'backgroundColor': 'rgb(50, 50, 50)',
+                    'color': 'white'
+                },
+                style_cell_conditional=[
+                    {'if': {'column_id': 'Modify'},
+                     'width': '10%'},
+                    {'if': {'column_id': 'Close'},
+                     'width': '10%'},
+                    {'if': {'column_id': 'Partial Close'},
+                     'width': '15%'},
+                ],
+                markdown_options={'html': True},
+                css=[
+                    {
+                        'selector': '.dash-cell div.dash-cell-value a.modify-button',
+                        'rule': 'display: inline-block; padding: 5px 10px; background-color: #1f78b4; color: white; border-radius: 3px; text-decoration: none;'
+                    },
+                    {
+                        'selector': '.dash-cell div.dash-cell-value a.close-button',
+                        'rule': 'background-color: #e74c3c;'
+                    },
+                    {
+                        'selector': '.dash-cell div.dash-cell-value a.partial-close-button',
+                        'rule': 'background-color: #f1c40f;'
+                    },
+                ],
+            )
+
+            return dbc.Card([
+                dbc.CardHeader(f'Trades in Group {group_id}'),
+                dbc.CardBody([
+                    detailed_table
+                ])
+            ], className='mb-4')
+    return ''
+
+# Callback to handle action buttons in detailed trade table
+@app.callback(
+    [
+        Output("modify-modal", "is_open"),
+        Output("close-modal", "is_open"),
+        Output("partial-modal", "is_open"),
+        Output("current-trade-id", "children"),
+        Output("modify-size-input", "value"),
+        Output("modify-tp-level-input", "value"),
+        Output("modify-sl-level-input", "value"),
+        Output("modify-comments-input", "value"),
+        Output("close-comments-input", "value"),
+        Output("partial-size-input", "value"),
+        Output("partial-comments-input", "value"),
+    ],
+    Input('detailed-trade-table', 'active_cell'),
+    State('detailed-trade-table', 'data'),
+    prevent_initial_call=True
+)
+def handle_trade_actions(active_cell, detailed_data):
+    ctx = callback_context
+    if active_cell:
+        row = active_cell['row']
+        column = active_cell['column_id']
+        if column in ['Modify', 'Close', 'Partial Close']:
+            trade = detailed_data[row]
+            trade_id = trade['trade_id']
+            if column == 'Modify':
+                return (
+                    True, False, False, str(trade_id),
+                    trade['size'], trade['tp_level'], trade['sl_level'], trade.get('comments', ''),
+                    '', None, ''
+                )
+            elif column == 'Close':
+                return (
+                    False, True, False, str(trade_id),
+                    None, None, None, '',
+                    '', None, ''
+                )
+            elif column == 'Partial Close':
+                default_partial_size = trade['size'] / 2
+                return (
+                    False, False, True, str(trade_id),
+                    None, None, None, '',
+                    '', default_partial_size, ''
+                )
+    return (False, False, False, '', None, None, None, '', None, None, '')
+
+# Callback to handle modifying a trade
+@app.callback(
+    Output('trade-data', 'data'),
+    Input('save-modify-button', 'n_clicks'),
+    State('trade-data', 'data'),
+    State('current-trade-id', 'children'),
+    State('modify-size-input', 'value'),
+    State('modify-tp-level-input', 'value'),
+    State('modify-sl-level-input', 'value'),
+    State('modify-comments-input', 'value'),
+    prevent_initial_call=True
+)
+def modify_trade(n_clicks, data, trade_id, size, tp_level, sl_level, comments):
+    if n_clicks > 0 and trade_id:
+        for trade in data:
+            if trade['trade_id'] == int(trade_id) and trade['action'] == 'open':
+                if size:
+                    trade['size'] = size
+                if tp_level:
+                    trade['tp_level'] = tp_level
+                if sl_level:
+                    trade['sl_level'] = sl_level
+                if comments:
+                    trade['comments'] = comments
+                break
+        return data
+    else:
+        raise dash.exceptions.PreventUpdate
+
+# Callback to handle closing a trade
+@app.callback(
+    Output('trade-data', 'data'),
+    Input('confirm-close-button', 'n_clicks'),
+    State('trade-data', 'data'),
+    State('current-trade-id', 'children'),
+    State('close-reason-input', 'value'),
+    State('close-price-input', 'value'),
+    State('close-comments-input', 'value'),
+    prevent_initial_call=True
+)
+def close_trade(n_clicks, data, trade_id, close_reason, close_price, close_comments):
+    if n_clicks > 0 and trade_id:
+        for trade in data:
+            if trade['trade_id'] == int(trade_id) and trade['action'] == 'open':
+                trade['close_datetime'] = format_datetime(datetime.datetime.now())
+                # Calculate trade duration
+                try:
+                    # Remove suffix before parsing
+                    day_str = trade['datetime'].split()[0]
+                    day_number = ''.join(filter(str.isdigit, day_str))
+                    trade_start = datetime.datetime.strptime(
+                        trade['datetime'].replace(day_str, day_number),
+                        '%d %b %Y %H:%M'
+                    )
+                except ValueError:
+                    # Fallback in case of unexpected format
+                    trade_start = datetime.datetime.now()
+                trade_duration = datetime.datetime.now() - trade_start
+                trade['trade_duration'] = str(trade_duration)
+                trade['action'] = 'closed'
+                trade['close_price'] = close_price
+                trade['closure_reason'] = close_reason
+                trade['comments'] = close_comments if close_comments else trade['comments']
+                # Calculate PNL
+                realized_pnl, pips_gained = calculate_pnl(
+                    trade['direction'],
+                    trade['entry_price'],
+                    close_price,
+                    trade['size']
+                )
+                trade['realized_pnl'] = realized_pnl
+                trade['pips_gained'] = pips_gained
+                # Update cumulative PNL
+                cumulative = sum([t['realized_pnl'] for t in data if t['realized_pnl'] is not None])
+                trade['cumulative_pnl'] = round(cumulative, 2)
+                break
+        return data
+    else:
+        raise dash.exceptions.PreventUpdate
+
+# Callback to handle partial closing a trade
+@app.callback(
+    Output('trade-data', 'data'),
+    Input('confirm-partial-button', 'n_clicks'),
+    State('trade-data', 'data'),
+    State('current-trade-id', 'children'),
+    State('partial-size-input', 'value'),
+    State('partial-comments-input', 'value'),
+    prevent_initial_call=True
+)
+def partial_close_trade(n_clicks, data, trade_id, partial_size, partial_comments):
+    if n_clicks > 0 and trade_id:
+        for trade in data:
+            if trade['trade_id'] == int(trade_id) and trade['action'] == 'open':
+                if partial_size and partial_size < trade['size']:
+                    # Create a new trade for the partial close
+                    new_trade_id = len(data) + 1
+                    now = datetime.datetime.now()
+                    datetime_str = format_datetime(now)
+                    realized_pnl, pips_gained = calculate_pnl(
+                        trade['direction'],
+                        trade['entry_price'],
+                        trade['close_price'] if trade['close_price'] else trade['entry_price'],
+                        partial_size
+                    )
+                    new_trade = {
+                        'trade_id': new_trade_id,
+                        'datetime': datetime_str,
+                        'close_datetime': format_datetime(now),
+                        'trade_duration': '0:00:00',
+                        'action': 'closed',
+                        'direction': trade['direction'],
+                        'size': partial_size,
+                        'entry_price': trade['entry_price'],
+                        'close_price': trade['close_price'] if trade['close_price'] else trade['entry_price'],
+                        'tp_level': trade['tp_level'],
+                        'sl_level': trade['sl_level'],
+                        'risk_reward_ratio': None,
+                        'realized_pnl': realized_pnl,
+                        'cumulative_pnl': 0.0,  # Will be updated later
+                        'pips_gained': pips_gained,
+                        'closure_reason': 'Partial Close',
+                        'TSL': None,
+                        'comments': partial_comments,
+                        'PNL_comment': None,
+                        'partial_tp_comment': None,
+                        'partial_tp_datetime': format_datetime(now),
+                        'partial_tp_close_price': trade['close_price'] if trade['close_price'] else trade['entry_price'],
+                        'Group_ID': trade['Group_ID']
+                    }
+                    data.append(new_trade)
+                    # Reduce the size of the original trade
+                    trade['size'] -= partial_size
+                    # Update cumulative PNL
+                    cumulative = sum([t['realized_pnl'] for t in data if t['realized_pnl'] is not None])
+                    trade['cumulative_pnl'] = round(cumulative, 2)
+                elif partial_size and partial_size >= trade['size']:
+                    # Close the trade entirely
+                    trade['close_datetime'] = format_datetime(datetime.datetime.now())
+                    # Calculate trade duration
+                    try:
+                        # Remove suffix before parsing
+                        day_str = trade['datetime'].split()[0]
+                        day_number = ''.join(filter(str.isdigit, day_str))
+                        trade_start = datetime.datetime.strptime(
+                            trade['datetime'].replace(day_str, day_number),
+                            '%d %b %Y %H:%M'
+                        )
+                    except ValueError:
+                        # Fallback in case of unexpected format
+                        trade_start = datetime.datetime.now()
+                    trade_duration = datetime.datetime.now() - trade_start
+                    trade['trade_duration'] = str(trade_duration)
+                    trade['action'] = 'closed'
+                    trade['close_price'] = trade['close_price'] if trade['close_price'] else trade['entry_price']
+                    trade['closure_reason'] = 'Partial Close'
+                    trade['comments'] = partial_comments if partial_comments else trade['comments']
+                    # Calculate PNL
+                    realized_pnl, pips_gained = calculate_pnl(
+                        trade['direction'],
+                        trade['entry_price'],
+                        trade['close_price'],
+                        trade['size']
+                    )
+                    trade['realized_pnl'] = realized_pnl
+                    trade['pips_gained'] = pips_gained
+                    # Update cumulative PNL
+                    cumulative = sum([t['realized_pnl'] for t in data if t['realized_pnl'] is not None])
+                    trade['cumulative_pnl'] = round(cumulative, 2)
+                break
+        return data
+    else:
+        raise dash.exceptions.PreventUpdate
+
+# Callbacks to toggle modals after actions are performed
+@app.callback(
+    Output("close-modal", "is_open"),
+    [
+        Input('confirm-close-button', 'n_clicks'),
+        Input('close-close-modal', 'n_clicks')
+    ],
+    State('close-modal', 'is_open'),
+    prevent_initial_call=True
+)
+def toggle_close_modal(n_confirm, n_cancel, is_open):
+    if n_confirm or n_cancel:
+        return not is_open
+    return is_open
+
+@app.callback(
+    Output("modify-modal", "is_open"),
+    [
+        Input('save-modify-button', 'n_clicks'),
+        Input('close-modify-modal', 'n_clicks')
+    ],
+    State('modify-modal', 'is_open'),
+    prevent_initial_call=True
+)
+def toggle_modify_modal(n_save, n_close, is_open):
+    if n_save or n_close:
+        return not is_open
+    return is_open
+
+@app.callback(
+    Output("partial-modal", "is_open"),
+    [
+        Input('confirm-partial-button', 'n_clicks'),
+        Input('close-partial-modal', 'n_clicks')
+    ],
+    State('partial-modal', 'is_open'),
+    prevent_initial_call=True
+)
+def toggle_partial_modal(n_confirm, n_cancel, is_open):
+    if n_confirm or n_cancel:
+        return not is_open
+    return is_open
+
+# Run the Dash app
+if __name__ == '__main__':
+    app.run_server(debug=True)
