@@ -1,0 +1,252 @@
+@app.callback(
+    Output('trade-data', 'data', allow_duplicate=True),
+    Input('add-trade-button', 'n_clicks'),
+    State('trade-data', 'data'),
+    State('direction-input', 'value'),
+    State('size-input', 'value'),
+    State('entry-price-input', 'value'),
+    State('tp-level-input', 'value'),
+    State('sl-level-input', 'value'),
+    State('comments-input', 'value'),
+    prevent_initial_call=True,
+    allow_duplicate=True
+)
+def add_trade(n_clicks, data, direction, size, entry_price, tp_level, sl_level, comments):
+    if n_clicks > 0:
+        # Validate inputs
+        if size <= 0 or entry_price <= 0 or tp_level <= 0 or sl_level <= 0:
+            raise PreventUpdate
+
+        # Calculate the trade's impact on net positions
+        trade_sign = 1 if direction == 'long' else -1
+        trade_net_size = trade_sign * size
+
+        # Fetch all open groups
+        groups = get_group_details(data)
+        open_groups = {gid: g for gid, g in groups.items() if g['status'] == 'Open'}
+
+        # Attempt to offset existing groups
+        remaining_size = size
+        for group_id, group in open_groups.items():
+            if group['net_size'] * trade_sign < 0:
+                # Opposite direction group found
+                offset_size = min(remaining_size, abs(group['net_size']))
+                if offset_size > 0:
+                    # Calculate PnL for the offset portion
+                    pnl, pips = calculate_pnl(
+                        direction='long' if trade_sign > 0 else 'short',
+                        entry_price=group['avg_entry_price'],
+                        close_price=entry_price,
+                        size=offset_size
+                    )
+
+                    # Create a closed trade for the offset portion
+                    closed_trade = {
+                        'trade_id': len(data) + 1,
+                        'datetime': format_datetime(datetime.datetime.now()),
+                        'close_datetime': format_datetime(datetime.datetime.now()),
+                        'trade_duration': '0:00:00',  # Immediate closure
+                        'action': 'closed',
+                        'direction': 'long' if trade_sign > 0 else 'short',
+                        'size': offset_size,
+                        'entry_price': group['avg_entry_price'],
+                        'close_price': entry_price,
+                        'tp_level': group['tp_level'],
+                        'sl_level': group['sl_level'],
+                        'risk_reward_ratio': None,
+                        'realized_pnl': pnl,
+                        'cumulative_pnl': 0.0,  # To be updated later
+                        'pips_gained': pips,
+                        'closure_reason': 'Offset by opposite trade',
+                        'TSL': None,
+                        'comments': comments,
+                        'PNL_comment': None,
+                        'partial_tp_comment': None,
+                        'partial_tp_datetime': format_datetime(datetime.datetime.now()),
+                        'partial_tp_close_price': entry_price,
+                        'Group_ID': group_id
+                    }
+                    data.append(closed_trade)
+
+                    # Update the original group's size
+                    for trade in data:
+                        if trade['Group_ID'] == group_id and trade['action'] == 'open':
+                            trade['size'] -= offset_size
+                            break  # Assuming one open trade per group for simplicity
+
+                    # Update remaining size
+                    remaining_size -= offset_size
+
+                    # Check if the group is fully closed
+                    if remaining_size == 0:
+                        break
+
+        # If there's remaining size, create a new open trade
+        if remaining_size > 0:
+            # Assign to a new group
+            new_group_id = max([trade['Group_ID'] for trade in data], default=0) + 1
+
+            new_trade = {
+                'trade_id': len(data) + 1,
+                'datetime': format_datetime(datetime.datetime.now()),
+                'close_datetime': None,
+                'trade_duration': None,
+                'action': 'open',
+                'direction': direction,
+                'size': remaining_size,
+                'entry_price': round(float(entry_price), 4),
+                'close_price': None,
+                'tp_level': round(float(tp_level), 4),
+                'sl_level': round(float(sl_level), 4),
+                'risk_reward_ratio': None,
+                'realized_pnl': 0.0,
+                'cumulative_pnl': 0.0,
+                'pips_gained': 0.0,
+                'closure_reason': None,
+                'TSL': None,
+                'comments': comments,
+                'PNL_comment': None,
+                'partial_tp_comment': None,
+                'partial_tp_datetime': None,
+                'partial_tp_close_price': None,
+                'Group_ID': new_group_id
+            }
+            data.append(new_trade)
+
+        return data
+    else:
+        raise PreventUpdate
+
+
+def get_group_details(data):
+    groups = {}
+    all_group_ids = set(trade['Group_ID'] for trade in data)
+    for group_id in all_group_ids:
+        group_trades = [trade for trade in data if trade['Group_ID'] == group_id]
+        net_size = sum(trade['size'] if trade['direction'] == 'long' else -trade['size'] for trade in group_trades if trade['action'] == 'open')
+        total_size = sum(trade['size'] for trade in group_trades if trade['action'] == 'open')
+        sum_entry_price = sum(float(trade['entry_price']) * trade['size'] for trade in group_trades if trade['action'] == 'open')
+        realized_pnl = sum(trade.get('realized_pnl', 0.0) for trade in group_trades if trade['action'] == 'closed')
+        pips_gained = sum(trade.get('pips_gained', 0.0) for trade in group_trades if trade['action'] == 'closed')
+        first_direction = group_trades[0]['direction'] if group_trades else 'long'
+        status = 'Open' if net_size != 0 else 'Closed'
+        # Get close_datetime from the latest closed trade in the group
+        closed_trades = [trade for trade in group_trades if trade['close_datetime']]
+        close_datetime = max([trade['close_datetime'] for trade in closed_trades], default=None)
+        
+        avg_entry_price = (sum_entry_price / total_size) if total_size != 0 else 0
+        
+        groups[group_id] = {
+            'Group_ID': group_id,
+            'net_size': net_size,
+            'total_size': total_size,
+            'avg_entry_price': avg_entry_price,
+            'realized_pnl': realized_pnl,
+            'pips_gained': pips_gained,
+            'first_direction': first_direction,
+            'status': status,
+            'close_datetime': close_datetime
+        }
+    return groups
+
+
+@app.callback(
+    Output('trade-data', 'data', allow_duplicate=True),
+    Input('confirm-close-button', 'n_clicks'),
+    State('trade-data', 'data'),
+    State('current-trade-id', 'children'),
+    State('close-reason-input', 'value'),
+    State('close-price-input', 'value'),
+    State('close-amount-input', 'value'),
+    State('close-comments-input', 'value'),
+    prevent_initial_call=True,
+    allow_duplicate=True
+)
+def close_trade(n_clicks, data, trade_id, close_reason, close_price, close_amount, close_comments):
+    if n_clicks > 0 and trade_id:
+        for trade in data:
+            if trade['trade_id'] == int(trade_id) and trade['action'] == 'open':
+                # Determine the amount to close
+                amount_to_close = close_amount if close_amount else trade['size']
+                amount_to_close = min(amount_to_close, trade['size'])  # Ensure not exceeding open size
+
+                # Partial closure logic
+                if amount_to_close < trade['size']:
+                    # Create a new closed trade with the specified amount
+                    new_trade_id = len(data) + 1
+                    now = datetime.datetime.now()
+                    datetime_str = format_datetime(now)
+                    close_price = close_price if close_price else get_audusd_price()
+                    realized_pnl, pips_gained = calculate_pnl(
+                        trade['direction'],
+                        trade['entry_price'],
+                        float(close_price),
+                        amount_to_close
+                    )
+                    closed_trade = {
+                        'trade_id': new_trade_id,
+                        'datetime': trade['datetime'],  # Keep original entry datetime
+                        'close_datetime': format_datetime(now),
+                        'trade_duration': str(now - datetime.datetime.strptime(trade['datetime'], '%Y-%m-%d %H:%M:%S')),
+                        'action': 'closed',
+                        'direction': trade['direction'],
+                        'size': amount_to_close,
+                        'entry_price': trade['entry_price'],
+                        'close_price': round(float(close_price), 4),
+                        'tp_level': trade['tp_level'],
+                        'sl_level': trade['sl_level'],
+                        'risk_reward_ratio': None,
+                        'realized_pnl': realized_pnl,
+                        'cumulative_pnl': 0.0,  # Will be updated later
+                        'pips_gained': pips_gained,
+                        'closure_reason': close_reason if close_reason else 'Manual Close',
+                        'TSL': None,
+                        'comments': close_comments,
+                        'PNL_comment': None,
+                        'partial_tp_comment': None,
+                        'partial_tp_datetime': format_datetime(now),
+                        'partial_tp_close_price': round(float(close_price), 4),
+                        'Group_ID': trade['Group_ID']
+                    }
+                    data.append(closed_trade)
+                    # Reduce the size of the original trade
+                    trade['size'] -= amount_to_close
+                else:
+                    # Full closure
+                    trade['close_datetime'] = format_datetime(datetime.datetime.now())
+                    trade['trade_duration'] = str(datetime.datetime.now() - datetime.datetime.strptime(trade['datetime'], '%Y-%m-%d %H:%M:%S'))
+                    trade['action'] = 'closed'
+                    trade['close_price'] = round(float(close_price), 4) if close_price else round(float(trade['entry_price']), 4)
+                    trade['closure_reason'] = close_reason if close_reason else 'Manual Close'
+                    trade['comments'] = close_comments if close_comments else trade['comments']
+                    # Calculate PNL
+                    realized_pnl, pips_gained = calculate_pnl(
+                        trade['direction'],
+                        trade['entry_price'],
+                        float(close_price) if close_price else trade['entry_price'],
+                        trade['size']
+                    )
+                    trade['realized_pnl'] = realized_pnl
+                    trade['pips_gained'] = pips_gained
+
+                # Update cumulative PNL for the group
+                group_trades = [t for t in data if t['Group_ID'] == trade['Group_ID']]
+                cumulative_pnl = sum(t['realized_pnl'] for t in group_trades if t['realized_pnl'] is not None)
+                for t in group_trades:
+                    t['cumulative_pnl'] = round(cumulative_pnl, 2)
+
+                break
+
+        # After closing a trade, update group statuses
+        groups = get_group_details(data)
+        for group_id, details in groups.items():
+            if details['net_size'] == 0:
+                for t in data:
+                    if t['Group_ID'] == group_id and t['action'] == 'open':
+                        t['action'] = 'closed'
+                        t['close_datetime'] = format_datetime(datetime.datetime.now())
+                        t['trade_duration'] = str(datetime.datetime.now() - datetime.datetime.strptime(t['datetime'], '%Y-%m-%d %H:%M:%S'))
+
+        return data
+    else:
+        raise PreventUpdate
