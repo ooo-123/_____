@@ -1,0 +1,1461 @@
+import dash
+import dash_bootstrap_components as dbc
+from dash import html, dcc, dash_table, Input, Output, State
+import pandas as pd
+import datetime
+import random
+
+# Attempt to import BLPAPI; if unavailable, set a flag
+try:
+    import blpapi
+    from blpapi import SessionOptions, Session
+    BLPAPI_AVAILABLE = True
+except ImportError:
+    BLPAPI_AVAILABLE = False
+    print("BLPAPI is not installed. Real-time price data will not be available.")
+
+# Backup function to generate simulated AUDUSD prices
+# Initialize with a default price
+SIMULATED_PRICE = 0.6890
+
+
+# CSS
+
+# Custom CSS for dark mode dropdown
+dropdown_dark_css = {
+    'dropdown': {
+        'backgroundColor': '#34495E',
+        'color': 'white',
+    },
+    'dropdown_menu': {
+        'backgroundColor': '#2C3E50',
+    },
+    'dropdown_item': {
+        'backgroundColor': '#2C3E50',
+        'color': 'white',
+    },
+    'dropdown_item_hover': {
+        'backgroundColor': '#1E2A3A',
+        'color': 'white',
+    },
+}
+def round_to_half_pip(price):
+    """
+    Rounds the price to the nearest half pip (0.00005).
+    The result will have either 4 or 5 decimal places,
+    with the 5th decimal being either 0 or 5.
+    """
+    return round(round(price * 20000) / 20000, 5)
+
+def get_simulated_audusd_price():
+    global SIMULATED_PRICE
+    # Define a pip
+    pip = 0.0001
+    # Randomly choose direction: up (+1) or down (-1)
+    direction = random.choice([-1, 1])
+    # Add minor random fluctuation
+    fluctuation = random.uniform(-0.00002, 0.00002)  # Minor fluctuation
+    # Calculate new price
+    new_price = SIMULATED_PRICE + (direction * pip) + fluctuation
+    # Ensure the new price stays within the specified range
+    new_price = max(0.6850, min(new_price, 0.6890))
+    # Round to the nearest half pip
+    SIMULATED_PRICE = round_to_half_pip(new_price)
+    return SIMULATED_PRICE
+
+# Function to fetch AUDUSD price using BLPAPI or simulate if unavailable
+def get_audusd_price():
+    if not BLPAPI_AVAILABLE:
+        return get_simulated_audusd_price()
+    try:
+        # Configure session options
+        options = SessionOptions()
+        options.setServerHost('localhost')  # Default host
+        options.setServerPort(8194)         # Default port
+
+        # Start a session
+        session = Session(options)
+        if not session.start():
+            raise Exception("Failed to start Bloomberg session.")
+        if not session.openService("//blp/refdata"):
+            raise Exception("Failed to open //blp/refdata service.")
+
+        # Obtain service
+        refDataService = session.getService("//blp/refdata")
+        request = refDataService.createRequest("ReferenceDataRequest")
+        request.getElement("securities").appendValue("AUDUSD Curncy")
+        request.getElement("fields").appendValue("LAST_PRICE")
+
+        # Send request
+        session.sendRequest(request)
+
+        # Process response
+        while True:
+            ev = session.nextEvent(500)
+            for msg in ev:
+                if msg.hasElement("responseError"):
+                    raise Exception(msg.getElement("responseError"))
+                if msg.hasElement("securityData"):
+                    securityDataArray = msg.getElement("securityData")
+                    for securityData in securityDataArray.values():
+                        fieldData = securityData.getElement("fieldData")
+                        if fieldData.hasElement("LAST_PRICE"):
+                            price = fieldData.getElementAsFloat("LAST_PRICE")
+                            session.stop()
+                            return round(price, 5)
+            if ev.eventType() == blpapi.Event.RESPONSE:
+                break
+    except Exception as e:
+        print(f"Error fetching AUDUSD price: {e}")
+        # Fallback to simulated price if any error occurs
+        return get_simulated_audusd_price()
+
+# Initialize the Dash app with a dark theme and suppress callback exceptions
+app = dash.Dash(
+    __name__,
+    external_stylesheets=[
+        dbc.themes.DARKLY,
+        'https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css'
+    ],
+    suppress_callback_exceptions=True,
+)
+app.title = "Trade Journaling Application"
+
+# Define the columns for the trade table
+trade_columns = [
+    'trade_id', 'datetime', 'close_datetime', 'trade_duration', 'action',
+    'direction', 'size', 'entry_price', 'close_price', 'tp_level', 'sl_level',
+    'risk_reward_ratio', 'realized_pnl', 'cumulative_pnl', 'pips_gained',
+    'closure_reason', 'TSL', 'comments', 'PNL_comment', 'partial_tp_comment',
+    'partial_tp_datetime', 'partial_tp_close_price', 'Group_ID'
+]
+
+# Initialize an empty DataFrame to store trades
+trade_history = pd.DataFrame(columns=trade_columns)
+
+# Function to format datetime in ISO format
+def format_datetime(dt):
+    return dt.strftime('%Y-%m-%d %H:%M:%S')
+
+# Function to calculate PnL
+def calculate_pnl(direction, entry_price, close_price, size):
+    position_sign = 1 if direction == 'long' else -1
+    pips = (close_price - entry_price) / 0.0001
+    pips_gained = pips * position_sign
+    realized_pnl = pips_gained * 100 * (size / 1_000_000)  # $100 per pip per 1M
+    return round(realized_pnl, 2), round(pips_gained, 2)
+
+# Function to format PNL with color coding
+def format_pnl(value):
+    if pd.isna(value):
+        return "$0.00"
+    formatted_value = f"${value:,.2f}"
+    if value > 0:
+        color = 'green'
+    elif value < 0:
+        color = 'red'
+    else:
+        color = 'white'
+    return html.Span(formatted_value, style={'color': color, 'fontWeight': 'bold'})
+
+# Function to ensure all price fields have 5 decimal places
+def format_price(price):
+    if price is None:
+        return 'N/A'
+    else:
+        return f"{float(price):.5f}"
+
+
+# Helper Function to Get Open Groups (net_size != 0)
+def get_open_groups(data):
+    group_net_sizes = {}
+    for trade in data:
+        if trade['action'] != 'open':
+            continue  # Only consider open trades
+        group_id = trade['Group_ID']
+        if group_id not in group_net_sizes:
+            group_net_sizes[group_id] = 0
+        group_net_sizes[group_id] += trade['size'] if trade['direction'] == 'long' else -trade['size']
+    open_groups = set(
+        group_id for group_id, net_size in group_net_sizes.items()
+        if net_size != 0
+    )
+    return open_groups
+
+# Track the net direction based on the first trade and maintain a separate flat status
+def get_group_details(data):
+    groups = {}
+    all_group_ids = set(trade['Group_ID'] for trade in data)
+    for group_id in all_group_ids:
+        group_trades = [trade for trade in data if trade['Group_ID'] == group_id]
+        net_size = sum(trade['size'] if trade['direction'] == 'long' else -trade['size'] for trade in group_trades if trade['action'] == 'open')
+        total_size = sum(trade['size'] for trade in group_trades)
+        sum_entry_price = sum(float(trade['entry_price']) * trade['size'] for trade in group_trades if trade['action'] == 'open')
+        realized_pnl = sum(trade.get('realized_pnl', 0.0) for trade in group_trades)
+        pips_gained = sum(trade.get('pips_gained', 0.0) for trade in group_trades)
+        # Determine net direction
+        if net_size > 0:
+            net_direction = 'long'
+        elif net_size < 0:
+            net_direction = 'short'
+        else:
+            net_direction = None  # Flat position
+        status = 'Open' if net_size != 0 else 'Closed'
+        # Get close_datetime from the latest trade in the group
+        close_datetimes = [trade['close_datetime'] for trade in group_trades if trade['close_datetime']]
+        close_datetime = max(close_datetimes) if close_datetimes else None
+        groups[group_id] = {
+            'Group_ID': group_id,
+            'net_size': net_size,
+            'total_size': total_size,
+            'sum_entry_price': sum_entry_price,
+            'realized_pnl': realized_pnl,
+            'pips_gained': pips_gained,
+            'net_direction': net_direction,
+            'status': status,
+            'close_datetime': close_datetime
+        }
+    return groups
+
+
+# App layout
+app.layout = dbc.Container([
+    html.H1('Trade Journaling Application', className='text-center mb-4'),
+
+    # Statistics Section
+    html.H2('Statistics', className='mb-4'),
+    # Unified Compact Statistics Section
+    # Compact Dark-themed Statistics Section
+    dbc.Card(
+        dbc.CardBody([
+            dbc.Row([
+                dbc.Col([
+                    html.Div([
+                        html.Span("PNL Today", className="text-light small me-2"),
+                        html.Span(id='pnl-today', children="$0.00", className="fw-bold text-white")
+                    ], className="d-flex justify-content-between align-items-center")
+                ], width=2, className="px-1"),
+                dbc.Col([
+                    html.Div([
+                        html.Span("PNL Week", className="text-light small me-2"),
+                        html.Span(id='pnl-week', children="$0.00", className="fw-bold text-white")
+                    ], className="d-flex justify-content-between align-items-center")
+                ], width=2, className="px-1"),
+                dbc.Col([
+                    html.Div([
+                        html.Span("PNL Month", className="text-light small me-2"),
+                        html.Span(id='pnl-month', children="$0.00", className="fw-bold text-white")
+                    ], className="d-flex justify-content-between align-items-center")
+                ], width=2, className="px-1"),
+                dbc.Col([
+                    html.Div([
+                        html.Span("PNL Year", className="text-light small me-2"),
+                        html.Span(id='pnl-year', children="$0.00", className="fw-bold text-white")
+                    ], className="d-flex justify-content-between align-items-center")
+                ], width=2, className="px-1"),
+                dbc.Col([
+                    html.Div([
+                        html.Span("All-Time PNL", className="text-light small me-2"),
+                        html.Span(id='pnl-all-time', children="$0.00", className="fw-bold text-white")
+                    ], className="d-flex justify-content-between align-items-center")
+                ], width=2, className="px-1"),
+                dbc.Col([
+                    html.Div([
+                        html.Span("Avg PNL", className="text-light small me-2"),
+                        html.Span(id='avg-pnl', children="$0.00", className="fw-bold text-white")
+                    ], className="d-flex justify-content-between align-items-center")
+                ], width=2, className="px-1"),
+            ], className="mb-2 g-2"),
+            dbc.Row([
+                dbc.Col([
+                    html.Div([
+                        html.Span("Avg Pips Gained", className="text-light small me-2"),
+                        html.Span([
+                            html.I(className="fas fa-arrow-up me-1", style={'color': '#28a745'}),
+                            html.Span(id='avg-pips-gained', children="0.00", className="text-white")
+                        ], className="fw-bold")
+                    ], className="d-flex justify-content-between align-items-center")
+                ], width=4, className="px-1"),
+                dbc.Col([
+                    html.Div([
+                        html.Span("Avg Pips Lost", className="text-light small me-2"),
+                        html.Span([
+                            html.I(className="fas fa-arrow-down me-1", style={'color': '#dc3545'}),
+                            html.Span(id='avg-pips-lost', children="0.00", className="text-white")
+                        ], className="fw-bold")
+                    ], className="d-flex justify-content-between align-items-center")
+                ], width=4, className="px-1"),
+                dbc.Col([
+                    html.Div([
+                        html.Span("Real-Time AUDUSD", className="text-light small me-2"),
+                        html.Span(id='audusd-price-display', children="Fetching...", className="fw-bold text-white")
+                    ], className="d-flex justify-content-between align-items-center")
+                ], width=4, className="px-1"),
+            ], className="g-2"),
+        ], className="p-2"),
+        className="mb-3 shadow-sm bg-dark"
+    ),
+    # Interval component for updating AUDUSD price every second
+    dcc.Interval(
+        id='price-update-interval',
+        interval=1*1000,  # 1 second in milliseconds
+        n_intervals=0
+    ),
+
+    # Store component to manage price update countdown and previous price
+    dcc.Store(id='price-update-store', data={'time_remaining': random.randint(1,5), 'prev_price': 0.6890}),
+
+    # Store component to track previous Unrealized PNL for each group
+    dcc.Store(id='previous-unrealized-pnl-store', data={}),
+
+    # New Trade Entry Form
+    # New Trade Entry Form
+html.Div([
+    html.H5('Enter New Trade', className='mb-2 text-light'),
+    dbc.Form([
+        dbc.Row([
+            dbc.Col([
+                dbc.InputGroup([
+                    dbc.InputGroupText("Direction", style={'background-color': '#2C3E50', 'color': 'white', 'border': '1px solid #34495E'}),
+                    dcc.Dropdown(
+                        id='direction-input',
+                        options=[{'label': 'Long', 'value': 'long'}, {'label': 'Short', 'value': 'short'}],
+                        value='long',
+                        clearable=False,
+                        style=dropdown_dark_css['dropdown'],
+                    ),
+                ], size="sm"),
+            ], width=3),
+            dbc.Col([
+                dbc.InputGroup([
+                    dbc.InputGroupText("Size (AUD)", style={'background-color': '#2C3E50', 'color': 'white', 'border': '1px solid #34495E'}),
+                    dbc.Input(
+                        id='size-input',
+                        type='number',
+                        value=1000000,
+                        step=100000,
+                        style={'background-color': '#34495E', 'color': 'white', 'border': '1px solid #34495E'}
+                    ),
+                ], size="sm"),
+            ], width=3),
+            dbc.Col([
+                dbc.InputGroup([
+                    dbc.InputGroupText("Entry", style={'background-color': '#2C3E50', 'color': 'white', 'border': '1px solid #34495E'}),
+                    dbc.Input(
+                        id='entry-price-input',
+                        type='number',
+                        value=0.6890,
+                        step=0.0001,
+                        debounce=True,
+                        style={'background-color': '#34495E', 'color': 'white', 'border': '1px solid #34495E'}
+                    ),
+                ], size="sm"),
+            ], width=2),
+            dbc.Col([
+                dbc.InputGroup([
+                    dbc.InputGroupText("TP", style={'background-color': '#2C3E50', 'color': 'white', 'border': '1px solid #34495E'}),
+                    dbc.Input(
+                        id='tp-level-input',
+                        type='number',
+                        value=0.6920,
+                        step=0.0001,
+                        style={'background-color': '#34495E', 'color': 'white', 'border': '1px solid #34495E'}
+                    ),
+                ], size="sm"),
+            ], width=2),
+            dbc.Col([
+                dbc.InputGroup([
+                    dbc.InputGroupText("SL", style={'background-color': '#2C3E50', 'color': 'white', 'border': '1px solid #34495E'}),
+                    dbc.Input(
+                        id='sl-level-input',
+                        type='number',
+                        value=0.6865,
+                        step=0.0001,
+                        style={'background-color': '#34495E', 'color': 'white', 'border': '1px solid #34495E'}
+                    ),
+                ], size="sm"),
+            ], width=2),
+        ], className='mb-2 g-2 align-items-center'),
+        dbc.Row([
+            dbc.Col([
+                dbc.InputGroup([
+                    dbc.InputGroupText("Comments", style={'background-color': '#2C3E50', 'color': 'white', 'border': '1px solid #34495E'}),
+                    dbc.Input(
+                        id='comments-input',
+                        type='text',
+                        style={'background-color': '#34495E', 'color': 'white', 'border': '1px solid #34495E'}
+                    ),
+                ], size="sm"),
+            ], width=10),
+            dbc.Col([
+                dbc.Button('Add Trade', id='add-trade-button', n_clicks=0, color='success', size="sm", className='w-100'),
+            ], width=2),
+        ], className='mb-2 g-2 align-items-center'),
+    ]),
+], className='p-3 border rounded', style={'background-color': '#1E2A3A', 'border-color': '#34495E'}),
+
+
+    # Grouped Trade Table
+    html.H2('Trade Groups', className='mb-3'),
+    dash_table.DataTable(
+        id='group-table',
+        columns=[
+            {'name': 'Group ID', 'id': 'Group_ID'},
+            {'name': 'Net Direction', 'id': 'net_direction'},
+            {'name': 'Total Size (AUD)', 'id': 'total_size'},
+            {'name': 'Average Entry Price', 'id': 'avg_entry_price'},
+            {'name': 'Realized PNL ($)', 'id': 'realized_pnl'},
+            {'name': 'Unrealized PNL ($)', 'id': 'unrealized_pnl'},
+            {'name': 'Status', 'id': 'status'},
+            {'name': 'Actions', 'id': 'actions', 'presentation': 'markdown'},
+        ],
+        data=[],
+        editable=False,
+        row_deletable=False,
+        sort_action='native',
+        page_action='none',
+        style_table={'overflowX': 'auto'},
+        style_cell={'textAlign': 'left'},
+        style_header={
+            'backgroundColor': 'rgb(30, 30, 30)',
+            'color': 'white',
+            'fontWeight': 'bold'
+        },
+        style_data={
+            'backgroundColor': 'rgb(50, 50, 50)',
+            'color': 'white'
+        },
+        style_cell_conditional=[
+            {'if': {'column_id': 'actions'},
+             'width': '15%'},
+            {'if': {'column_id': 'status'},
+             'width': '10%'},
+        ],
+        style_data_conditional=[
+            {
+                'if': {
+                    'filter_query': '{status} = "Open"',
+                    'column_id': 'status'
+                },
+                'backgroundColor': 'green',
+                'color': 'white'
+            },
+            {
+                'if': {
+                    'filter_query': '{status} = "Closed"',
+                    'column_id': 'status'
+                },
+                'backgroundColor': 'grey',
+                'color': 'white'
+            },
+            {
+                'if': {
+                    'filter_query': '{net_direction} = "Long"',
+                    'column_id': 'net_direction'
+                },
+                'backgroundColor': '#90EE90',  # Light Green
+                'color': 'black'
+            },
+            {
+                'if': {
+                    'filter_query': '{net_direction} = "Short"',
+                    'column_id': 'net_direction'
+                },
+                'backgroundColor': '#FFB6C1',  # Light Red
+                'color': 'black'
+            },
+            {
+                'if': {
+                    'filter_query': '{realized_pnl_value} > 0',
+                    'column_id': 'realized_pnl'
+                },
+                'color': 'green',
+                'fontWeight': 'bold'
+            },
+            {
+                'if': {
+                    'filter_query': '{realized_pnl_value} < 0',
+                    'column_id': 'realized_pnl'
+                },
+                'color': 'red',
+                'fontWeight': 'bold'
+            },
+            {
+                'if': {
+                    'filter_query': '{unrealized_pnl_value} > 0',
+                    'column_id': 'unrealized_pnl'
+                },
+                'color': 'green',
+                'fontWeight': 'bold'
+            },
+            {
+                'if': {
+                    'filter_query': '{unrealized_pnl_value} < 0',
+                    'column_id': 'unrealized_pnl'
+                },
+                'color': 'red',
+                'fontWeight': 'bold'
+            },
+        ],
+        markdown_options={'html': True},
+        css=[
+            {
+                'selector': '.dash-cell div.dash-cell-value a.view-trades',
+                'rule': 'display: inline-block; padding: 5px 10px; background-color: #1f78b4; color: white; border-radius: 3px; text-decoration: none;'
+            },
+        ],
+    ),
+
+    # Detailed Trade Table (Visible upon selecting a group)
+    html.Div(id='detailed-trade-table-container'),
+
+    # Modals for Modify, Close
+
+    # Modify Modal
+    dbc.Modal([
+        dbc.ModalHeader(dbc.ModalTitle("Modify Trade")),
+        dbc.ModalBody([
+            dbc.Form([
+                dbc.Row([
+                    dbc.Col([
+                        dbc.Label('Size (in AUD)', html_for='modify-size-input'),
+                        dbc.Input(
+                            id='modify-size-input',
+                            type='number',
+                            step=100000,
+                            style={'width': '100%'}
+                        ),
+                    ], width=6),
+                    dbc.Col([
+                        dbc.Label('Entry Price', html_for='modify-entry-price-input'),
+                        dbc.Input(
+                            id='modify-entry-price-input',
+                            type='number',
+                            step=0.0001,
+                            style={'width': '100%'}
+                        ),
+                    ], width=6),
+                ], className='mb-3'),
+                dbc.Row([
+                    dbc.Col([
+                        dbc.Label('Entry Datetime', html_for='modify-entry-datetime-input'),
+                        dbc.Input(
+                            id='modify-entry-datetime-input',
+                            type='text',
+                            placeholder='YYYY-MM-DD HH:MM:SS',
+                            style={'width': '100%'}
+                        ),
+                    ], width=6),
+                    dbc.Col([
+                        dbc.Label('Exit Datetime', html_for='modify-exit-datetime-input'),
+                        dbc.Input(
+                            id='modify-exit-datetime-input',
+                            type='text',
+                            placeholder='YYYY-MM-DD HH:MM:SS',
+                            style={'width': '100%'}
+                        ),
+                    ], width=6),
+                ], className='mb-3'),
+                dbc.Row([
+                    dbc.Col([
+                        dbc.Label('TP Level', html_for='modify-tp-level-input'),
+                        dbc.Input(
+                            id='modify-tp-level-input',
+                            type='number',
+                            step=0.0001,
+                            style={'width': '100%'}
+                        ),
+                    ], width=6),
+                    dbc.Col([
+                        dbc.Label('SL Level', html_for='modify-sl-level-input'),
+                        dbc.Input(
+                            id='modify-sl-level-input',
+                            type='number',
+                            step=0.0001,
+                            style={'width': '100%'}
+                        ),
+                    ], width=6),
+                ], className='mb-3'),
+                dbc.Row([
+                    dbc.Col([
+                        dbc.Label('Comments', html_for='modify-comments-input'),
+                        dbc.Input(
+                            id='modify-comments-input',
+                            type='text',
+                            style={'width': '100%'}
+                        ),
+                    ], width=12),
+                ], className='mb-3'),
+            ]),
+        ]),
+        dbc.ModalFooter([
+            dbc.Button("Save Changes", id="save-modify-button", color="primary"),
+            dbc.Button("Close", id="close-modify-modal", className="ms-auto", color="secondary"),
+        ]),
+    ], id="modify-modal", is_open=False, centered=True),
+
+    # Close Modal
+    dbc.Modal([
+        dbc.ModalHeader(dbc.ModalTitle("Close Trade")),
+        dbc.ModalBody([
+            dbc.Form([
+                dbc.Row([
+                    dbc.Col([
+                        dbc.Label('Closure Reason', html_for='close-reason-input'),
+                        dcc.Dropdown(
+                            id='close-reason-input',
+                            options=[
+                                {'label': 'TP Hit', 'value': 'TP hit'},
+                                {'label': 'SL Hit', 'value': 'SL hit'},
+                                {'label': 'Manual Close', 'value': 'manual close'},
+                            ],
+                            value='manual close',
+                            clearable=False,
+                            style={'width': '100%', 'color': 'black'}
+                        ),
+                    ], width=6),
+                    dbc.Col([
+                        dbc.Label('Amount to Close (in AUD)', html_for='close-amount-input'),
+                        dbc.Input(
+                            id='close-amount-input',
+                            type='number',
+                            step=100000,
+                            style={'width': '100%'},
+                            debounce=True
+                        ),
+                        dbc.FormText("Default is 1M or the remaining open position size."),
+                    ], width=6),
+                ], className='mb-3'),
+                dbc.Row([
+                    dbc.Col([
+                        dbc.Label('Close Price', html_for='close-price-input'),
+                        dcc.Input(
+                            id='close-price-input',
+                            type='number',
+                            step=0.0001,
+                            style={'width': '100%'},
+                            debounce=True
+                        ),
+                    ], width=6),
+                    dbc.Col([
+                        dbc.Label('Comments', html_for='close-comments-input'),
+                        dbc.Input(
+                            id='close-comments-input',
+                            type='text',
+                            style={'width': '100%'}
+                        ),
+                    ], width=6),
+                ], className='mb-3'),
+            ]),
+        ]),
+        dbc.ModalFooter([
+            dbc.Button("Confirm Close", id="confirm-close-button", color="danger"),
+            dbc.Button("Cancel", id="close-close-modal", className="ms-auto", color="secondary"),
+        ]),
+    ], id="close-modal", is_open=False, centered=True),
+
+    # Hidden div to store the trade ID being modified/closed
+    html.Div(id='current-trade-id', style={'display': 'none'}),
+
+    # Store component to hold trade data
+    dcc.Store(id='trade-data', data=trade_history.to_dict('records')),
+
+], fluid=True)
+
+# Callback to update the real-time AUDUSD price with randomized intervals and formatting
+@app.callback(
+    Output('audusd-price-display', 'children'),
+    Output('price-update-store', 'data'),
+    Input('price-update-interval', 'n_intervals'),
+    State('price-update-store', 'data'),
+    prevent_initial_call=False
+)
+def update_audusd_price(n_intervals, store_data):
+    # Decrement the countdown
+    store_data['time_remaining'] -= 1
+
+    if store_data['time_remaining'] <= 0:
+        # Time to update the price
+        new_price = get_audusd_price()
+        prev_price = store_data['prev_price']
+
+        # Determine if price went up or down
+        if new_price > prev_price:
+            color = 'green'
+            triangle = '▲'
+        elif new_price < prev_price:
+            color = 'red'
+            triangle = '▼'
+        else:
+            color = 'white'
+            triangle = ''
+
+        # Update the store with new time_remaining and prev_price
+        store_data['time_remaining'] = random.randint(1,5)
+        store_data['prev_price'] = new_price
+
+        # Format the display
+        price_display = html.Span([
+            f"{format_price(new_price)} ",
+            html.Span(triangle, style={'color': color})
+        ], style={'color': color, 'fontWeight': 'bold'})
+    else:
+        # Not time to update yet, display current price without changes
+        new_price = store_data['prev_price']
+        price_display = html.Span([
+            f"{format_price(new_price)} "
+        ], style={'color': 'white', 'fontWeight': 'bold'})
+
+    return price_display, store_data
+
+# Callback to update Entry Price, TP Level, and SL Level based on Real-Time Price and Direction
+@app.callback(
+    [
+        Output('entry-price-input', 'value'),
+        Output('tp-level-input', 'value'),
+        Output('sl-level-input', 'value')
+    ],
+    [
+        Input('price-update-store', 'data'),
+        Input('direction-input', 'value'),
+    ],
+    prevent_initial_call=True,
+)
+def update_entry_tp_sl(store_data, direction):
+    real_time_price = store_data.get('prev_price', 0.6890)
+    if real_time_price is None or direction is None:
+        raise dash.exceptions.PreventUpdate
+    entry_price = real_time_price
+    pip_value = 0.0001
+    tp_pips = 30 * pip_value  # 30 pips
+    sl_pips = 25 * pip_value  # 25 pips
+    if direction == 'long':
+        tp_level = entry_price + tp_pips
+        sl_level = entry_price - sl_pips
+    else:  # 'short'
+        tp_level = entry_price - tp_pips
+        sl_level = entry_price + sl_pips
+    # Round to 4 decimal places for formatting consistency
+    entry_price = round(entry_price, 4)
+    tp_level = round(tp_level, 4)
+    sl_level = round(sl_level, 4)
+    return entry_price, tp_level, sl_level
+
+@app.callback(
+    Output('trade-data', 'data', allow_duplicate=True),
+    Input('add-trade-button', 'n_clicks'),
+    State('trade-data', 'data'),
+    State('direction-input', 'value'),
+    State('size-input', 'value'),
+    State('entry-price-input', 'value'),
+    State('tp-level-input', 'value'),
+    State('sl-level-input', 'value'),
+    State('comments-input', 'value'),
+    prevent_initial_call=True,
+    allow_duplicate=True
+)
+def add_trade(n_clicks, data, direction, size, entry_price, tp_level, sl_level, comments):
+    if n_clicks > 0:
+        # Validate inputs
+        if size <= 0:
+            raise dash.exceptions.PreventUpdate
+        if entry_price <= 0 or tp_level <= 0 or sl_level <= 0:
+            raise dash.exceptions.PreventUpdate
+
+        # Determine if there's an existing open group
+        groups = get_group_details(data)
+        open_groups = {gid: details for gid, details in groups.items() if details['status'] == 'Open'}
+
+        if open_groups:
+            # Use the latest open group
+            group_id = max(open_groups.keys())
+            group_details = open_groups[group_id]
+            group_net_direction = 'long' if group_details['net_size'] > 0 else 'short'
+        else:
+            # Create a new group
+            group_id = max([trade['Group_ID'] for trade in data], default=0) + 1
+            group_net_direction = direction  # The new group's net direction is the direction of the first trade
+
+        # Determine if the new trade is in the same direction as the group's net direction
+        if open_groups and direction == group_net_direction:
+            # Same direction, simply add the trade to the group
+            new_trade = create_new_trade_entry(data, group_id, direction, size, entry_price, tp_level, sl_level, comments)
+            data.append(new_trade)
+        else:
+            # Opposite direction, need to offset existing positions
+            data = offset_positions(data, group_id, direction, size, entry_price, comments)
+
+        return data
+    else:
+        raise dash.exceptions.PreventUpdate
+
+# Helper function to create a new trade entry
+def offset_positions(data, group_id, new_direction, new_size, new_entry_price, comments):
+    """
+    Offsets existing open positions in the group with the new trade in the opposite direction.
+    """
+    remaining_size = new_size
+    now = datetime.datetime.now()
+    datetime_str = format_datetime(now)
+    trades_in_group = [trade for trade in data if trade['Group_ID'] == group_id and trade['action'] == 'open']
+
+    # Sort trades_in_group by datetime (FIFO)
+    trades_in_group.sort(key=lambda x: datetime.datetime.strptime(x['datetime'], '%Y-%m-%d %H:%M:%S'))
+
+    for trade in trades_in_group:
+        if remaining_size <= 0:
+            break
+
+        open_size = trade['size']
+        offset_amount = min(open_size, remaining_size)
+
+        # Calculate PnL for the closed portion
+        realized_pnl, pips_gained = calculate_pnl(
+            trade['direction'],
+            trade['entry_price'],
+            new_entry_price,
+            offset_amount
+        )
+
+        # Update the existing open trade
+        trade['size'] -= offset_amount
+        if trade['size'] == 0:
+            # Fully closed trade
+            trade['close_datetime'] = datetime_str
+            trade['trade_duration'] = str(now - datetime.datetime.strptime(trade['datetime'], '%Y-%m-%d %H:%M:%S'))
+            trade['action'] = 'closed'
+            trade['close_price'] = round(float(new_entry_price), 4)
+            trade['realized_pnl'] = realized_pnl
+            trade['pips_gained'] = pips_gained
+            trade['closure_reason'] = 'Offset by new trade'
+            trade['comments'] = comments or trade.get('comments', '')
+        else:
+            # Partially closed trade, split into two trades
+            closed_trade = trade.copy()
+            closed_trade['trade_id'] = len(data) + 1
+            closed_trade['size'] = offset_amount
+            closed_trade['close_datetime'] = datetime_str
+            closed_trade['trade_duration'] = str(now - datetime.datetime.strptime(closed_trade['datetime'], '%Y-%m-%d %H:%M:%S'))
+            closed_trade['action'] = 'closed'
+            closed_trade['close_price'] = round(float(new_entry_price), 4)
+            closed_trade['realized_pnl'] = realized_pnl
+            closed_trade['pips_gained'] = pips_gained
+            closed_trade['closure_reason'] = 'Offset by new trade'
+            closed_trade['comments'] = comments or closed_trade.get('comments', '')
+            data.append(closed_trade)
+
+        # Reduce remaining size
+        remaining_size -= offset_amount
+
+    if remaining_size > 0:
+        # Add the remaining size as a new open trade in the group
+        new_trade = {
+            'trade_id': len(data) + 1,
+            'datetime': datetime_str,
+            'close_datetime': None,
+            'trade_duration': None,
+            'action': 'open',
+            'direction': new_direction,
+            'size': remaining_size,
+            'entry_price': round(float(new_entry_price), 4),
+            'close_price': None,
+            'tp_level': None,
+            'sl_level': None,
+            'risk_reward_ratio': None,
+            'realized_pnl': 0.0,
+            'cumulative_pnl': 0.0,
+            'pips_gained': 0.0,
+            'closure_reason': None,
+            'TSL': None,
+            'comments': comments,
+            'PNL_comment': None,
+            'partial_tp_comment': None,
+            'partial_tp_datetime': None,
+            'partial_tp_close_price': None,
+            'Group_ID': group_id
+        }
+        data.append(new_trade)
+
+    # Update cumulative PnL
+    cumulative_pnl = sum([t['realized_pnl'] for t in data if t['realized_pnl'] is not None])
+    for trade in data:
+        trade['cumulative_pnl'] = round(cumulative_pnl, 2)
+
+    return data
+# Helper function to create a new trade entry
+def create_new_trade_entry(data, group_id, direction, size, entry_price, tp_level, sl_level, comments):
+    now = datetime.datetime.now()
+    datetime_str = format_datetime(now)
+    new_trade = {
+        'trade_id': len(data) + 1,
+        'datetime': datetime_str,
+        'close_datetime': None,
+        'trade_duration': None,
+        'action': 'open',
+        'direction': direction,
+        'size': size,
+        'entry_price': round(float(entry_price), 4),
+        'close_price': None,
+        'tp_level': round(float(tp_level), 4) if tp_level else None,
+        'sl_level': round(float(sl_level), 4) if sl_level else None,
+        'risk_reward_ratio': None,
+        'realized_pnl': 0.0,
+        'cumulative_pnl': 0.0,
+        'pips_gained': 0.0,
+        'closure_reason': None,
+        'TSL': None,
+        'comments': comments,
+        'PNL_comment': None,
+        'partial_tp_comment': None,
+        'partial_tp_datetime': None,
+        'partial_tp_close_price': None,
+        'Group_ID': group_id
+    }
+    return new_trade
+
+
+# Updated format_pnl function
+def format_pnl(value):
+    if pd.isna(value):
+        return "$0.00"
+    return f"${value:,.2f}"
+
+# Updated update_group_table callback
+@app.callback(
+    [
+        Output('group-table', 'data'),
+        Output('previous-unrealized-pnl-store', 'data'),
+    ],
+    [
+        Input('trade-data', 'data'),
+        Input('price-update-store', 'data')
+    ],
+    [
+        State('previous-unrealized-pnl-store', 'data'),
+    ],
+    prevent_initial_call=True,
+)
+def update_group_table(data, store_data, previous_pnl_store):
+    groups = get_group_details(data)
+    group_data = []
+    updated_previous_pnl_store = previous_pnl_store.copy()
+
+    for group_id, details in groups.items():
+        # Define net_direction based on the group's net direction
+        net_direction = 'Long' if details['net_direction'] == 'long' else 'Short' if details['net_direction'] == 'short' else 'Flat'
+        # Calculate average entry price
+        if abs(details['net_size']) > 0:
+            avg_entry_price = details['sum_entry_price'] / abs(details['net_size'])
+        else:
+            avg_entry_price = 0
+        # Calculate unrealized PNL based on real-time price
+        if details['status'] == 'Closed' or abs(details['net_size']) == 0:
+            unrealized_pnl = 0.0
+            triangle = ''
+        else:
+            real_time_price = store_data.get('prev_price', 0.6890)
+            direction_sign = 1 if details['net_direction'] == 'long' else -1
+            # Calculate pips gained based on average entry price and real-time price
+            pips_gained = (real_time_price - avg_entry_price) / 0.0001 * direction_sign
+            # Calculate unrealized PNL
+            unrealized_pnl = pips_gained * 100 * (abs(details['net_size']) / 1_000_000)  # $100 per pip per 1M
+            unrealized_pnl = round(unrealized_pnl, 2)
+
+            # Determine triangle based on PNL change
+            previous_pnl = previous_pnl_store.get(str(group_id), 0.0)
+            if unrealized_pnl > previous_pnl:
+                triangle = ' ▲'  # Upward green triangle
+            elif unrealized_pnl < previous_pnl:
+                triangle = ' ▼'  # Downward red triangle
+            else:
+                triangle = ''
+
+            # Update the previous_pnl_store with current unrealized_pnl
+            updated_previous_pnl_store[str(group_id)] = unrealized_pnl
+
+        group = {
+            'Group_ID': group_id,
+            'net_direction': net_direction,
+            'total_size': f"{abs(details['net_size']):,}",
+            'avg_entry_price': format_price(avg_entry_price),
+            'realized_pnl': format_pnl(details['realized_pnl']),  # Now returns a string
+            'realized_pnl_value': details['realized_pnl'],
+            'unrealized_pnl': f"{format_pnl(unrealized_pnl)}{triangle}",  # Now a string
+            'unrealized_pnl_value': unrealized_pnl,
+            'status': details['status'],
+            'actions': f"<a href='#' class='view-trades'>View Trades</a>"
+        }
+        group_data.append(group)
+    return group_data, updated_previous_pnl_store
+
+# Callback to display detailed trades for a selected group
+@app.callback(
+    Output('detailed-trade-table-container', 'children'),
+    Input('group-table', 'active_cell'),
+    State('group-table', 'data'),
+    State('trade-data', 'data'),
+    prevent_initial_call=True
+)
+def display_detailed_trades(active_cell, group_data, trade_data):
+    if active_cell:
+        row = active_cell['row']
+        column = active_cell['column_id']
+        if column == 'actions':
+            group_id = group_data[row]['Group_ID']
+            # Filter trades belonging to this group
+            detailed_trades = [trade for trade in trade_data if trade['Group_ID'] == group_id]
+            detailed_trades_sorted = sorted(detailed_trades, key=lambda x: x['trade_id'], reverse=True)
+
+            # Add action buttons with HTML links and classes
+            for trade in detailed_trades_sorted:
+                trade_id = trade['trade_id']
+                trade['Modify'] = f"<a href='#' class='modify-button'>Modify</a>"
+                trade['Close'] = f"<a href='#' class='close-button'>Close</a>"
+                # Ensure all price fields are formatted with padded zeros
+                trade['entry_price_display'] = format_price(trade['entry_price'])
+                trade['close_price_display'] = format_price(trade['close_price']) if trade['close_price'] else "N/A"
+                trade['tp_level_display'] = format_price(trade['tp_level'])
+                trade['sl_level_display'] = format_price(trade['sl_level'])
+                # Format PNL for display
+                trade['realized_pnl_display'] = format_pnl(trade['realized_pnl']) if trade['realized_pnl'] else "$0.00"
+                # Format close_datetime for display
+                trade['close_datetime_display'] = trade['close_datetime'] if trade['close_datetime'] else 'N/A'
+
+            # Create detailed trade table
+            detailed_table = dash_table.DataTable(
+                id='detailed-trade-table',
+                columns=[
+                    {'name': 'Trade ID', 'id': 'trade_id'},
+                    {'name': 'Datetime', 'id': 'datetime'},
+                    {'name': 'Exit Datetime', 'id': 'close_datetime_display'},
+                    {'name': 'Direction', 'id': 'direction'},
+                    {'name': 'Size (AUD)', 'id': 'size'},
+                    {'name': 'Entry Price', 'id': 'entry_price_display'},
+                    {'name': 'Close Price', 'id': 'close_price_display'},
+                    {'name': 'TP Level', 'id': 'tp_level_display'},
+                    {'name': 'SL Level', 'id': 'sl_level_display'},
+                    {'name': 'Realized PNL ($)', 'id': 'realized_pnl_display'},
+                    {'name': 'Pips Gained', 'id': 'pips_gained'},
+                    {'name': 'Comments', 'id': 'comments'},
+                    {'name': 'Modify', 'id': 'Modify', 'presentation': 'markdown'},
+                    {'name': 'Close', 'id': 'Close', 'presentation': 'markdown'},
+                ],
+                data=detailed_trades_sorted,
+                editable=False,
+                row_deletable=False,
+                sort_action='native',
+                page_action='none',
+                style_table={'overflowX': 'auto'},
+                style_cell={'textAlign': 'left'},
+                style_header={
+                    'backgroundColor': 'rgb(30, 30, 30)',
+                    'color': 'white',
+                    'fontWeight': 'bold'
+                },
+                style_data={
+                    'backgroundColor': 'rgb(50, 50, 50)',
+                    'color': 'white'
+                },
+                style_cell_conditional=[
+                    {'if': {'column_id': 'Modify'},
+                     'width': '10%'},
+                    {'if': {'column_id': 'Close'},
+                     'width': '10%'},
+                ],
+                # Color code the Realized PNL column
+                style_data_conditional=[
+                    {
+                        'if': {
+                            'filter_query': '{realized_pnl} > 0',
+                            'column_id': 'realized_pnl_display'
+                        },
+                        'color': 'green',
+                        'fontWeight': 'bold'
+                    },
+                    {
+                        'if': {
+                            'filter_query': '{realized_pnl} < 0',
+                            'column_id': 'realized_pnl_display'
+                        },
+                        'color': 'red',
+                        'fontWeight': 'bold'
+                    },
+                ],
+                markdown_options={'html': True},
+                css=[
+                    {
+                        'selector': '.dash-cell div.dash-cell-value a.modify-button',
+                        'rule': 'display: inline-block; padding: 5px 10px; background-color: #1f78b4; color: white; border-radius: 3px; text-decoration: none;'
+                    },
+                    {
+                        'selector': '.dash-cell div.dash-cell-value a.close-button',
+                        'rule': 'background-color: #e74c3c; padding: 5px 10px; color: white; border-radius: 3px; text-decoration: none;'
+                    },
+                ],
+            )
+
+            return dbc.Card([
+                dbc.CardHeader(f'Trades in Group {group_id}'),
+                dbc.CardBody([
+                    detailed_table
+                ])
+            ], className='mb-4')
+    return ''
+
+# Callback to handle action buttons in detailed trade table
+@app.callback(
+    [
+        Output("modify-modal", "is_open", allow_duplicate=True),
+        Output("close-modal", "is_open", allow_duplicate=True),
+        Output("current-trade-id", "children"),
+        Output("modify-size-input", "value"),
+        Output("modify-entry-price-input", "value"),
+        Output("modify-entry-datetime-input", "value"),
+        Output("modify-exit-datetime-input", "value"),
+        Output("modify-tp-level-input", "value"),
+        Output("modify-sl-level-input", "value"),
+        Output("modify-comments-input", "value"),
+        Output("close-price-input", "value"),
+        Output("close-amount-input", "value"),
+        Output("close-comments-input", "value"),
+    ],
+    Input('detailed-trade-table', 'active_cell'),
+    State('detailed-trade-table', 'data'),
+    State('trade-data', 'data'),
+    prevent_initial_call=True
+)
+def handle_trade_actions(active_cell, detailed_data, trade_data):
+    if active_cell:
+        row = active_cell['row']
+        column = active_cell['column_id']
+        if column in ['Modify', 'Close']:
+            trade = detailed_data[row]
+            trade_id = trade['trade_id']
+            if column == 'Modify':
+                # Use the stored datetime strings
+                entry_datetime = trade['datetime']
+                exit_datetime = trade['close_datetime'] if trade['close_datetime'] else ''
+
+                return (
+                    True, False, str(trade_id),
+                    trade['size'],
+                    trade['entry_price'],
+                    entry_datetime,
+                    exit_datetime,
+                    trade['tp_level'], trade['sl_level'], trade.get('comments', ''),
+                    '', '', ''
+                )
+            elif column == 'Close':
+                # Determine the default amount to close
+                trade_to_close = next((t for t in trade_data if t['trade_id'] == trade_id), None)
+                if trade_to_close:
+                    default_close_amount = min(1_000_000, trade_to_close['size'])
+                else:
+                    default_close_amount = 1_000_000
+                return (
+                    False, True, str(trade_id),
+                    None, None, None, None, None, None, '',
+                    round(get_audusd_price(), 4), round(default_close_amount, 2), ''
+                )
+    return (False, False, '', None, None, None, None, None, None, '', '', '', '')
+
+# Callback to handle modifying a trade
+@app.callback(
+    Output('trade-data', 'data', allow_duplicate=True),
+    Input('save-modify-button', 'n_clicks'),
+    State('trade-data', 'data'),
+    State('current-trade-id', 'children'),
+    State('modify-size-input', 'value'),
+    State('modify-entry-price-input', 'value'),
+    State('modify-entry-datetime-input', 'value'),
+    State('modify-exit-datetime-input', 'value'),
+    State('modify-tp-level-input', 'value'),
+    State('modify-sl-level-input', 'value'),
+    State('modify-comments-input', 'value'),
+    prevent_initial_call=True,
+    allow_duplicate=True
+)
+def modify_trade(n_clicks, data, trade_id, size, entry_price, entry_datetime_str, exit_datetime_str, tp_level, sl_level, comments):
+    if n_clicks > 0 and trade_id:
+        for trade in data:
+            if trade['trade_id'] == int(trade_id):
+                if size and size > 0:
+                    trade['size'] = size
+                if entry_price and entry_price > 0:
+                    trade['entry_price'] = round(float(entry_price), 4)
+                if tp_level and tp_level > 0:
+                    trade['tp_level'] = round(float(tp_level), 4)
+                if sl_level and sl_level > 0:
+                    trade['sl_level'] = round(float(sl_level), 4)
+                if comments is not None:
+                    trade['comments'] = comments
+                if entry_datetime_str:
+                    try:
+                        entry_datetime = datetime.datetime.strptime(entry_datetime_str, '%Y-%m-%d %H:%M:%S')
+                        trade['datetime'] = format_datetime(entry_datetime)
+                    except ValueError:
+                        pass  # Handle invalid datetime format
+                if exit_datetime_str:
+                    try:
+                        exit_datetime = datetime.datetime.strptime(exit_datetime_str, '%Y-%m-%d %H:%M:%S')
+                        trade['close_datetime'] = format_datetime(exit_datetime)
+                        # Recalculate trade duration
+                        entry_datetime_parsed = datetime.datetime.strptime(trade['datetime'], '%Y-%m-%d %H:%M:%S')
+                        trade_duration = exit_datetime - entry_datetime_parsed
+                        trade['trade_duration'] = str(trade_duration)
+                    except ValueError:
+                        pass  # Handle invalid datetime format
+                break
+        return data
+    else:
+        raise dash.exceptions.PreventUpdate
+
+# Callback to handle closing a trade with specified amount
+@app.callback(
+    Output('trade-data', 'data', allow_duplicate=True),
+    Input('confirm-close-button', 'n_clicks'),
+    State('trade-data', 'data'),
+    State('current-trade-id', 'children'),
+    State('close-reason-input', 'value'),
+    State('close-price-input', 'value'),
+    State('close-amount-input', 'value'),
+    State('close-comments-input', 'value'),
+    prevent_initial_call=True,
+    allow_duplicate=True
+)
+def close_trade(n_clicks, data, trade_id, close_reason, close_price, close_amount, close_comments):
+    if n_clicks > 0 and trade_id:
+        for trade in data:
+            if trade['trade_id'] == int(trade_id) and trade['action'] == 'open':
+                # Determine the amount to close
+                amount_to_close = close_amount if close_amount else trade['size']
+                amount_to_close = min(amount_to_close, trade['size'])  # Ensure not exceeding open size
+
+                # Partial closure logic
+                if amount_to_close < trade['size']:
+                    # Create a new closed trade with the specified amount
+                    new_trade_id = len(data) + 1
+                    now = datetime.datetime.now()
+                    datetime_str = format_datetime(now)
+                    close_price = close_price if close_price else get_audusd_price()
+                    realized_pnl, pips_gained = calculate_pnl(
+                        trade['direction'],
+                        trade['entry_price'],
+                        float(close_price),
+                        amount_to_close
+                    )
+                    new_trade = {
+                        'trade_id': new_trade_id,
+                        'datetime': trade['datetime'],  # Keep original entry datetime
+                        'close_datetime': format_datetime(now),
+                        'trade_duration': str(now - datetime.datetime.strptime(trade['datetime'], '%Y-%m-%d %H:%M:%S')),
+                        'action': 'closed',
+                        'direction': trade['direction'],
+                        'size': amount_to_close,
+                        'entry_price': trade['entry_price'],
+                        'close_price': round(float(close_price), 4),
+                        'tp_level': trade['tp_level'],
+                        'sl_level': trade['sl_level'],
+                        'risk_reward_ratio': None,
+                        'realized_pnl': realized_pnl,
+                        'cumulative_pnl': 0.0,  # Will be updated later
+                        'pips_gained': pips_gained,
+                        'closure_reason': close_reason if close_reason else 'Manual Close',
+                        'TSL': None,
+                        'comments': close_comments,
+                        'PNL_comment': None,
+                        'partial_tp_comment': None,
+                        'partial_tp_datetime': format_datetime(now),
+                        'partial_tp_close_price': round(float(close_price), 4),
+                        'Group_ID': trade['Group_ID']
+                    }
+                    data.append(new_trade)
+                    # Reduce the size of the original trade
+                    trade['size'] -= amount_to_close
+                    # Update cumulative PNL
+                    cumulative = sum([t['realized_pnl'] for t in data if t['realized_pnl'] is not None])
+                    trade['cumulative_pnl'] = round(cumulative, 2)
+                else:
+                    # Full closure
+                    trade['close_datetime'] = format_datetime(datetime.datetime.now())
+                    # Calculate trade duration
+                    try:
+                        trade_start = datetime.datetime.strptime(trade['datetime'], '%Y-%m-%d %H:%M:%S')
+                    except ValueError:
+                        trade_start = datetime.datetime.now()
+                    trade_duration = datetime.datetime.now() - trade_start
+                    trade['trade_duration'] = str(trade_duration)
+                    trade['action'] = 'closed'
+                    trade['close_price'] = round(float(close_price), 4) if close_price else round(float(trade['entry_price']), 4)
+                    trade['closure_reason'] = close_reason if close_reason else 'Manual Close'
+                    trade['comments'] = close_comments if close_comments else trade['comments']
+                    # Calculate PNL
+                    realized_pnl, pips_gained = calculate_pnl(
+                        trade['direction'],
+                        trade['entry_price'],
+                        float(close_price) if close_price else trade['entry_price'],
+                        trade['size']
+                    )
+                    trade['realized_pnl'] = realized_pnl
+                    trade['pips_gained'] = pips_gained
+                    # Update cumulative PNL
+                    cumulative = sum([t['realized_pnl'] for t in data if t['realized_pnl'] is not None])
+                    trade['cumulative_pnl'] = round(cumulative, 2)
+                break
+
+        # After closing a trade, check if the group nets to zero and update status
+        groups = get_group_details(data)
+        for group_id, details in groups.items():
+            if details['status'] == 'Closed':
+                # All trades in this group are closed
+                pass
+        return data
+
+# Callbacks to toggle modals after actions are performed
+@app.callback(
+    Output("close-modal", "is_open"),
+    [
+        Input('confirm-close-button', 'n_clicks'),
+        Input('close-close-modal', 'n_clicks')
+    ],
+    State('close-modal', 'is_open'),
+    prevent_initial_call=True
+)
+def toggle_close_modal(n_confirm, n_cancel, is_open):
+    if n_confirm or n_cancel:
+        return not is_open
+    return is_open
+
+@app.callback(
+    Output("modify-modal", "is_open"),
+    [
+        Input('save-modify-button', 'n_clicks'),
+        Input('close-modify-modal', 'n_clicks')
+    ],
+    State('modify-modal', 'is_open'),
+    prevent_initial_call=True
+)
+def toggle_modify_modal(n_save, n_close, is_open):
+    if n_save or n_close:
+        return not is_open
+    return is_open
+
+# Callback to update the statistics section
+@app.callback(
+    [
+        Output('pnl-today', 'children'),
+        Output('pnl-week', 'children'),
+        Output('pnl-month', 'children'),
+        Output('pnl-year', 'children'),
+        Output('pnl-all-time', 'children'),
+        Output('avg-pnl', 'children'),
+        Output('avg-pips-gained', 'children'),
+        Output('avg-pips-lost', 'children'),
+    ],
+    Input('trade-data', 'data'),
+    prevent_initial_call=False
+)
+def update_statistics(trade_data):
+    # Convert trade_data to DataFrame
+    df = pd.DataFrame(trade_data)
+
+    if not df.empty:
+        # Ensure that 'close_datetime' is datetime type
+        df['close_datetime'] = pd.to_datetime(df['close_datetime'], format='%Y-%m-%d %H:%M:%S', errors='coerce')
+        df['realized_pnl'] = pd.to_numeric(df['realized_pnl'], errors='coerce')
+        df['pips_gained'] = pd.to_numeric(df['pips_gained'], errors='coerce')
+
+        # Filter only closed trades
+        closed_trades = df[df['action'] == 'closed']
+
+        # Today's date
+        today = pd.Timestamp('today').normalize()
+        # Start of the week (most recent Monday)
+        start_of_week = today - pd.Timedelta(days=today.weekday())
+        # Start of the month
+        start_of_month = today.replace(day=1)
+        # Start of the year
+        start_of_year = today.replace(month=1, day=1)
+
+        # PNL Today
+        pnl_today = closed_trades[closed_trades['close_datetime'] >= today]['realized_pnl'].sum()
+        # PNL This Week
+        pnl_week = closed_trades[closed_trades['close_datetime'] >= start_of_week]['realized_pnl'].sum()
+        # PNL This Month
+        pnl_month = closed_trades[closed_trades['close_datetime'] >= start_of_month]['realized_pnl'].sum()
+        # PNL This Year
+        pnl_year = closed_trades[closed_trades['close_datetime'] >= start_of_year]['realized_pnl'].sum()
+        # All-Time PNL
+        pnl_all_time = closed_trades['realized_pnl'].sum()
+
+        # Average PNL
+        avg_pnl = closed_trades['realized_pnl'].mean()
+
+        # Average Pips Gained
+        profitable_trades = closed_trades[closed_trades['realized_pnl'] > 0]
+        avg_pips_gained = profitable_trades['pips_gained'].mean()
+
+        # Average Pips Lost
+        losing_trades = closed_trades[closed_trades['realized_pnl'] < 0]
+        avg_pips_lost = losing_trades['pips_gained'].mean()
+
+        # Format the statistics for display with color coding
+        return (
+            html.Span(format_pnl(pnl_today), style={'color': 'green' if pnl_today > 0 else 'red' if pnl_today < 0 else 'white'}),
+            html.Span(format_pnl(pnl_week), style={'color': 'green' if pnl_week > 0 else 'red' if pnl_week < 0 else 'white'}),
+            html.Span(format_pnl(pnl_month), style={'color': 'green' if pnl_month > 0 else 'red' if pnl_month < 0 else 'white'}),
+            html.Span(format_pnl(pnl_year), style={'color': 'green' if pnl_year > 0 else 'red' if pnl_year < 0 else 'white'}),
+            html.Span(format_pnl(pnl_all_time), style={'color': 'green' if pnl_all_time > 0 else 'red' if pnl_all_time < 0 else 'white'}),
+            html.Span(format_pnl(avg_pnl) if not pd.isna(avg_pnl) else "$0.00", style={'color': 'green' if avg_pnl > 0 else 'red' if avg_pnl < 0 else 'white'}),
+            html.Span(f"{avg_pips_gained:.2f}" if not pd.isna(avg_pips_gained) else "0.00", style={'color': 'green' if avg_pips_gained > 0 else 'red' if avg_pips_gained < 0 else 'white'}),
+            html.Span(f"{avg_pips_lost:.2f}" if not pd.isna(avg_pips_lost) else "0.00", style={'color': 'red' if avg_pips_lost < 0 else 'white'}),  # Assuming avg_pips_lost is always <= 0
+        )
+    else:
+        # If the dataframe is empty, return zeros for all statistics
+        return ("$0.00", "$0.00", "$0.00", "$0.00", "$0.00", "$0.00", "0.00", "0.00")
+
+
+# Add this to your app's CSS
+app.css.append_css({
+    'external_url': 'https://cdnjs.cloudflare.com/ajax/libs/font-awesome/4.7.0/css/font-awesome.min.css'
+})
+
+# Add these styles to your app
+app.index_string = '''
+<!DOCTYPE html>
+<html>
+    <head>
+        {%metas%}
+        <title>{%title%}</title>
+        {%favicon%}
+        {%css%}
+        <style>
+            .Select-control, .Select-menu-outer, .Select-option {
+                background-color: #2C3E50 !important;
+                color: white !important;
+            }
+            .Select-option:hover {
+                background-color: #1E2A3A !important;
+            }
+            .Select-value-label {
+                color: white !important;
+            }
+            .Select-arrow {
+                border-color: white transparent transparent !important;
+            }
+        </style>
+    </head>
+    <body>
+        {%app_entry%}
+        <footer>
+            {%config%}
+            {%scripts%}
+            {%renderer%}
+        </footer>
+    </body>
+</html>
+'''
+
+# Run the Dash app
+if __name__ == '__main__':
+    app.run_server(debug=True)
